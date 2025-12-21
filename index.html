@@ -281,42 +281,43 @@ function tryImportFromURL(){
 }
 
 /* ====== カギ足計算（改善版） ====== */
-function calcKagi(list, reversalAmount) {
+function calcKagi(list, step) {
   if (!list.length) return [];
 
   const k = [];
-  const first = list[0];
-  let last = first.price;
-  let trend = 1;       // 1: 上昇, -1: 下降
-  let extremum = first.price;
+  let last = list[0].price;
+  let trend = 0; // 1: 上昇, -1: 下降
 
-  k.push({ x: 0, y: last, trend, timestamp: first.timestamp });
+  k.push({ x: 0, y: last, trend, timestamp: list[0].timestamp });
 
   for (let i = 1; i < list.length; i++) {
-    const p = list[i].price;
+    let price = list[i].price;
+    let diff = price - last;
 
-    if (trend === 1) {
-      if (p > extremum) {
-        extremum = p;
-        last = p;
-        k.push({ x: k.length, y: p, trend, timestamp: list[i].timestamp });
-      } else if (p < extremum - reversalAmount) {
-        trend = -1;
-        extremum = p;
-        last = p;
-        k.push({ x: k.length, y: p, trend, timestamp: list[i].timestamp });
-      }
-    } else {
-      if (p < extremum) {
-        extremum = p;
-        last = p;
-        k.push({ x: k.length, y: p, trend, timestamp: list[i].timestamp });
-      } else if (p > extremum + reversalAmount) {
-        trend = 1;
-        extremum = p;
-        last = p;
-        k.push({ x: k.length, y: p, trend, timestamp: list[i].timestamp });
-      }
+    // 上方向に何ステップ動いたか
+    while (diff >= step) {
+      last += step;
+      trend = 1;
+      k.push({
+        x: k.length,
+        y: last,
+        trend,
+        timestamp: list[i].timestamp
+      });
+      diff = price - last;
+    }
+
+    // 下方向に何ステップ動いたか
+    while (diff <= -step) {
+      last -= step;
+      trend = -1;
+      k.push({
+        x: k.length,
+        y: last,
+        trend,
+        timestamp: list[i].timestamp
+      });
+      diff = price - last;
     }
   }
 
