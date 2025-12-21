@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>日経225先物 手動入力カギ足</title>
+
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{
+  font-family:system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,"Noto Sans JP",sans-serif;
+  background:#1e3c72;
+  min-height:100vh;
+  padding:20px;
+}
+.container{
+  max-width:1100px;
+  margin:0 auto;
+  background:#fff;
+  border-radius:16px;
+  box-shadow:0 12px 30px rgba(0,0,0,.15);
+  overflow:hidden;
+}
+.header{
+  background:#16213e;
+  color:#fff;
+  padding:16px;
+  text-align:center;
+}
+.main{
+  display:grid;
+  grid-template-columns:360px 1fr;
+}
+@media(max-width:900px){
+  .main{grid-template-columns:1fr}
+}
+.left{padding:14px;background:#f8f9fa}
+.right{padding:14px}
+.card{
+  background:#fff;
+  border-radius:12px;
+  box-shadow:0 2px 8px rgba(0,0,0,.06);
+  padding:12px;
+  margin-bottom:12px;
+}
+h2{font-size:14px;margin-bottom:6px}
+.input{width:100%;padding:8px;border:2px solid #ddd;border-radius:8px}
+.btn{padding:8px 12px;border:none;border-radius:8px;cursor:pointer;color:#fff}
+.btn-green{background:#27ae60}
+.btn-gray{background:#7f8c8d}
+.toolbar{
+  display:flex;
+  gap:8px;
+  align-items:center;
+  margin-bottom:8px;
+}
+.canvas-wrap{
+  border:1px solid #ddd;
+  border-radius:12px;
+  padding:6px;
+}
+canvas{width:100%;height:380px;display:block}
+.info{font-size:12px;color:#666}
+</style>
+</head>
+
+<body>
+<div class="container">
+  <div class="header">
+    <h1>📈 日経225先物 手動入力カギ足</h1>
+  </div>
+
+  <div class="main">
+    <div class="left">
+      <div class="card">
+        <h2>価格入力</h2>
+        <input id="priceInput" type="number" class="input" placeholder="例: 33500">
+        <button id="addPriceBtn" class="btn btn-green" style="margin-top:6px">追加</button>
+      </div>
+
+      <div class="card">
+        <h2>転換幅</h2>
+        <input id="reversalAmount" type="number" class="input" value="50">
+      </div>
+    </div>
+
+    <div class="right">
+      <div class="toolbar">
+        <span class="info">表示範囲</span>
+        <input id="chartRange" type="range" min="0" max="100" value="100">
+        <span id="rangeInfo" class="info">全表示</span>
+      </div>
+
+      <div class="canvas-wrap">
+        <canvas id="kagiCanvas"></canvas>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+/* ========= DOM ========= */
+const el={
+  priceInput:document.getElementById('priceInput'),
+  addPriceBtn:document.getElementById('addPriceBtn'),
+  reversalAmount:document.getElementById('reversalAmount'),
+  chartRange:document.getElementById('chartRange'),
+  rangeInfo:document.getElementById('rangeInfo'),
+  kagiCanvas:document.getElementById('kagiCanvas')
+};
+
+/* ========= 状態 ========= */
+let priceData=[];
+let kagiData=[];
+let hoverInfo=null;
+let viewStart=0, viewEnd=0, maxViewWidth=20;
+
+/* ========= Canvas ========= */
+const ctx=el.kagiCanvas.getContext('2d');
+
+function resizeCanvas(){
+  const dpr=Math.max(1,window.devicePixelRatio||1);
+  const rect=el.kagiCanvas.getBoundingClientRect();
+  el.kagiCanvas.width=rect.width*dpr;
+  el.kagiCanvas.height=rect.height*dpr;
+  ctx.setTransform(1,0,0,1,0,0);
+  ctx.scale(dpr,dpr);
+}
+window.addEventListener('resize',()=>{resizeCanvas();drawChart();});
+
+/* ========= カギ足 ========= */
+function calcKagi(list,rev){
+  if(!list.length) return [];
+  let k=[],trend=1,ext=list[0].price;
+  k.push({x:0,y:list[0].price,timestamp:list[0].timestamp,trend});
+  for(let i=1;i<list.length;i++){
+    const p=list[i].price;
+    if(trend===1){
+      if(p>ext){ext=p;k.push({x:k.length,y:p,trend,timestamp:list[i].timestamp});}
+      else if(p<ext-rev){trend=-1;ext=p;k.push({x:k.length,y:p,trend,timestamp:list[i].timestamp});}
+    }else{
+      if(p<ext){ext=p;k.push({x:k.length,y:p,trend,timestamp:list[i].timestamp});}
+      else if(p>ext+rev){trend=1;ext=p;k.push({x:k.length,y:p,trend,timestamp:list[i].timestamp});}
+    }
+  }
+  return k;
+}
+
+/* ========= 描画 ========= */
+function drawTooltip(x,y,lines){
+  ctx.save();
+  ctx.font='12px system-ui';
+  const pad=6;
+  const w=Math.max(...lines.map(t=>ctx.measureText(t).width))+pad*2;
+  const h=lines.length*16+pad*2;
+  let bx=x+10, by=y-h-10;
+  ctx.fillStyle='rgba(0,0,0,.8)';
+  ctx.strokeStyle='#fff';
+  ctx.lineWidth=1;
+  ctx.beginPath();
+  ctx.roundRect(bx,by,w,h,6);
+  ctx.fill();ctx.stroke();
+  ctx.fillStyle='#fff';
+  lines.forEach((t,i)=>ctx.fillText(t,bx+pad,by+pad+16*(i+0.8)));
+  ctx.restore();
+}
+
+function drawChart(){
+  const W=el.kagiCanvas.clientWidth;
+  const H=el.kagiCanvas.clientHeight;
+  ctx.clearRect(0,0,W,H);
+  if(!kagiData.length) return;
+
+  const total=kagiData.length;
+  const width=Math.min(maxViewWidth,total);
+  viewEnd=total;
+  viewStart=Math.max(0,total-width);
+
+  let minY=Math.min(...kagiData.map(p=>p.y));
+  let maxY=Math.max(...kagiData.map(p=>p.y));
+
+  const pad={l:40,r:10,t:10,b:20};
+  const x2px=x=>pad.l+(x-viewStart)/(viewEnd-viewStart)*(W-pad.l-pad.r);
+  const y2px=y=>H-pad.b-(y-minY)/(maxY-minY)*(H-pad.t-pad.b);
+
+  for(let i=1;i<kagiData.length;i++){
+    const a=kagiData[i-1],b=kagiData[i];
+    ctx.strokeStyle=a.trend===1?'#2ecc71':'#e74c3c';
+    ctx.lineWidth=3;
+    ctx.beginPath();
+    ctx.moveTo(x2px(a.x),y2px(a.y));
+    ctx.lineTo(x2px(b.x),y2px(b.y));
+    ctx.stroke();
+  }
+
+  kagiData.forEach(p=>{
+    const x=x2px(p.x),y=y2px(p.y);
+    ctx.fillStyle=p.trend===1?'#2ecc71':'#e74c3c';
+    ctx.beginPath();ctx.arc(x,y,6,0,Math.PI*2);ctx.fill();
+  });
+
+  if(hoverInfo){
+    drawTooltip(hoverInfo.x,hoverInfo.y,hoverInfo.lines);
+  }
+}
+
+/* ========= ヒット判定 ========= */
+function canvasPoint(e){
+  const r=el.kagiCanvas.getBoundingClientRect();
+  return {
+    x:(e.clientX||e.touches[0].clientX)-r.left,
+    y:(e.clientY||e.touches[0].clientY)-r.top
+  };
+}
+
+el.kagiCanvas.addEventListener('click',e=>{
+  const p=canvasPoint(e);
+  hoverInfo=null;
+  kagiData.forEach(k=>{
+    const dx=p.x-(40+(k.x-viewStart)/(viewEnd-viewStart)*(el.kagiCanvas.clientWidth-50));
+    const dy=p.y-(el.kagiCanvas.clientHeight-20-(k.y-Math.min(...kagiData.map(v=>v.y)))/(Math.max(...kagiData.map(v=>v.y))-Math.min(...kagiData.map(v=>v.y)))*(el.kagiCanvas.clientHeight-30));
+    if(dx*dx+dy*dy<100){
+      hoverInfo={
+        x:p.x,y:p.y,
+        lines:[
+          '¥'+k.y.toLocaleString(),
+          new Date(k.timestamp).toLocaleString()
+        ]
+      };
+    }
+  });
+  drawChart();
+});
+
+/* ========= 操作 ========= */
+el.addPriceBtn.onclick=()=>{
+  const v=+el.priceInput.value;
+  if(!v) return;
+  priceData.push({price:v,timestamp:Date.now()});
+  kagiData=calcKagi(priceData,+el.reversalAmount.value);
+  hoverInfo=null;
+  drawChart();
+  el.priceInput.value='';
+};
+
+/* ========= 起動 ========= */
+resizeCanvas();
+drawChart();
+</script>
+</body>
+</html>
