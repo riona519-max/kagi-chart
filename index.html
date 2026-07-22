@@ -73,6 +73,9 @@ canvas{display:block;width:100%;height:380px;touch-action:manipulation;}
         <label>転換幅 (円)</label>
         <input id="reversalAmount" type="number" class="input" value="50" step="1" min="1" />
         <div class="section-note">※ 直近の高値／安値からこの金額以上の逆方向への動きで転換します</div>
+        <label style="margin-top:8px;display:flex;gap:6px;align-items:center">
+          <input type="checkbox" id="showPricePoints" checked>入力価格の丸を表示
+        </label>
         <div class="row" style="margin-top:8px">
           <button id="recalculateBtn" class="btn btn-amber small">🔄 再計算</button>
           <button id="shareLinkBtn" class="btn btn-dark small">🔗 共有リンク</button>
@@ -187,7 +190,7 @@ canvas{display:block;width:100%;height:380px;touch-action:manipulation;}
 /* ====== DOM ====== */
 const el = {};
 [
-  'priceInput','datetimeInput','reversalAmount','tradeType',
+  'priceInput','datetimeInput','reversalAmount','tradeType','showPricePoints',
   'addPriceBtn','addTradeBtn','deleteSelectedTradeBtn','clearTradesBtn',
   'recalculateBtn','sampleBtn','clearBtn','downloadBtn','saveBtn','restoreBtn',
   'exportJsonBtn','importJsonBtn','importFile','importCsvBtn','importCsvFile',
@@ -198,8 +201,8 @@ const el = {};
 ].forEach(id => el[id] = document.getElementById(id));
 
 /* ====== 状態 ====== */
-let priceData=[], kagiData=[], trades=[];
-let selectedIdx=null, selectedTradeIdx=null;
+let priceData=[], kagiData=[], pricePoints=[], trades=[];
+let selectedIdx=null, selectedPriceIdx=null, selectedTradeIdx=null;
 let viewStart=0, viewEnd=0, maxViewWidth=20;
 
 const STORAGE_KEY='kagi_manual_storage_v2';
@@ -234,14 +237,23 @@ function restoreLocal(){
   }
 }
 function getStateObj(){
-  return {priceData,trades,reversalAmount:+el.reversalAmount.value,maxViewWidth,_meta:{updatedAt:Date.now(),clientId,version:2}};
+  return {
+    priceData,
+    trades,
+    reversalAmount:+el.reversalAmount.value,
+    showPricePoints: !!el.showPricePoints.checked,
+    maxViewWidth,
+    _meta:{updatedAt:Date.now(),clientId,version:3}
+  };
 }
 function applyState(s){
   priceData=s.priceData||[];
-  trades=s.trades||[];
+  // 旧データ互換：src が無いマークは転換点(kagi)扱い
+  trades=(s.trades||[]).map(t=>({...t, src: t.src || 'kagi'}));
   if(typeof s.reversalAmount==='number') el.reversalAmount.value=s.reversalAmount;
+  if(typeof s.showPricePoints==='boolean') el.showPricePoints.checked=s.showPricePoints;
   if(typeof s.maxViewWidth==='number') maxViewWidth=s.maxViewWidth;
-  selectedIdx=null; selectedTradeIdx=null;
+  selectedIdx=null; selectedPriceIdx=null; selectedTradeIdx=null;
   drawAll();
   if(s._meta?.updatedAt) lastSyncedAt = s._meta.updatedAt;
 }
@@ -284,44 +296,42 @@ function tryImportFromURL(){
    ・同方向の動きは線を延長するだけ（点は増えない）
    ・直近の極値から転換幅以上の逆行が出たときだけ折り返す
    ・転換幅未満の逆行は無視
+   戻り値: { points:[...], segOfInput:[各入力インデックスが属するセグメント番号] }
 */
 function calcKagi(list, step){
-  if(!list.length) return [];
+  if(!list.length) return { points:[], segOfInput:[] };
   if(step<=0) step=1;
 
   const k=[];
-  let extreme = list[0].price;   // 直近の極値（現在の線の先端）
-  let trend = 0;                 // 1:上昇 -1:下降 0:未確定
+  const segOfInput=new Array(list.length).fill(0);
+  let extreme = list[0].price;
+  let trend = 0;
 
   k.push({ y: extreme, trend: 0, timestamp: list[0].timestamp });
+  segOfInput[0]=0;
 
   for(let i=1;i<list.length;i++){
     const price = list[i].price;
     const ts = list[i].timestamp;
 
     if(trend===0){
-      // 最初の方向が決まるまで：転換幅以上動いたら方向確定
       if(price - extreme >= step){
-        trend = 1;
-        extreme = price;
+        trend = 1; extreme = price;
         k.push({ y: extreme, trend, timestamp: ts });
       } else if(extreme - price >= step){
-        trend = -1;
-        extreme = price;
+        trend = -1; extreme = price;
         k.push({ y: extreme, trend, timestamp: ts });
       }
+      segOfInput[i]=k.length-1;
       continue;
     }
 
     if(trend===1){
       if(price > extreme){
-        // 同方向：先端を伸ばす（点は増やさない）
         extreme = price;
         k[k.length-1] = { y: extreme, trend, timestamp: ts };
       } else if(extreme - price >= step){
-        // 転換：下降へ
-        trend = -1;
-        extreme = price;
+        trend = -1; extreme = price;
         k.push({ y: extreme, trend, timestamp: ts });
       }
     } else {
@@ -329,14 +339,14 @@ function calcKagi(list, step){
         extreme = price;
         k[k.length-1] = { y: extreme, trend, timestamp: ts };
       } else if(price - extreme >= step){
-        trend = 1;
-        extreme = price;
+        trend = 1; extreme = price;
         k.push({ y: extreme, trend, timestamp: ts });
       }
     }
+    segOfInput[i]=k.length-1;
   }
 
-  return k.map((p,i)=>({ ...p, x:i }));
+  return { points: k.map((p,i)=>({ ...p, x:i })), segOfInput };
 }
 
 function toPath(d){
@@ -352,6 +362,29 @@ function toPath(d){
   return r;
 }
 
+/* セグメント番号 → 描画x座標 の対応表を作る */
+function buildSegToX(d){
+  // d = calcKagi の points（セグメント順）。toPath と同じロジックで x を再現
+  const map=[];
+  if(!d.length) return map;
+  let x=0; map[0]=0;
+  for(let i=1;i<d.length;i++){
+    if(d[i].trend!==d[i-1].trend) x++;
+    map[i]=x;
+  }
+  return map;
+}
+
+/* 入力価格の丸を作る（B案：属するカギ足セグメントのx上に、入力価格の高さで置く） */
+function buildPricePoints(list, segOfInput, segToX){
+  return list.map((d,i)=>({
+    x: segToX[segOfInput[i]] ?? 0,
+    y: d.price,
+    timestamp: d.timestamp,
+    priceIndex: i
+  }));
+}
+
 /* ====== Canvas 描画（DPR対応） ====== */
 const ctx = el.kagiCanvas.getContext('2d');
 let cachedDpr = 1;
@@ -359,13 +392,9 @@ let cachedDpr = 1;
 function resizeCanvas(){
   const dpr = Math.max(1, window.devicePixelRatio || 1);
   const rect = el.kagiCanvas.getBoundingClientRect();
-
   el.kagiCanvas.width  = Math.floor(rect.width * dpr);
   el.kagiCanvas.height = Math.floor(rect.height * dpr);
-
   cachedDpr = dpr;
-
-  // 以後、描画座標はCSSピクセルで扱う（内部でdpr倍される）
   ctx.setTransform(dpr,0,0,dpr,0,0);
 }
 
@@ -436,7 +465,7 @@ function drawTooltipAt(x, y, lines) {
   ctx.restore();
 }
 
-const hitAreas={kagi:[],trade:[]};
+const hitAreas={kagi:[],price:[],trade:[]};
 
 function drawChart(){
   clearCanvasCssSpace();
@@ -448,12 +477,21 @@ function drawChart(){
   const widthX = Math.min(maxViewWidth, totalX);
   if(viewEnd===0){ viewEnd = totalX; viewStart = Math.max(0, viewEnd - widthX); }
 
+  const showPP = !!el.showPricePoints.checked;
+
   let minY = Infinity, maxY = -Infinity;
   kagiData.forEach(p=>{
     if(p.x<viewStart || p.x>viewEnd) return;
     if(p.y<minY) minY=p.y;
     if(p.y>maxY) maxY=p.y;
   });
+  if(showPP){
+    pricePoints.forEach(p=>{
+      if(p.x<viewStart || p.x>viewEnd) return;
+      if(p.y<minY) minY=p.y;
+      if(p.y>maxY) maxY=p.y;
+    });
+  }
   if(minY===Infinity){ minY=0; maxY=1; }
   if(maxY-minY<1){ maxY=minY+1; }
 
@@ -461,6 +499,7 @@ function drawChart(){
   const x2px = x => pad.l + ((x - viewStart)/(viewEnd - viewStart)) * (W - pad.l - pad.r);
   const y2px = y => H - pad.b - ((y - minY)/(maxY - minY)) * (H - pad.t - pad.b);
 
+  // カギ足の線
   ctx.lineWidth = 2; ctx.lineJoin = 'round'; ctx.lineCap = 'round';
   for(let i=1;i<kagiData.length;i++){
     const a=kagiData[i-1], b=kagiData[i];
@@ -471,7 +510,23 @@ function drawChart(){
     ctx.beginPath(); ctx.moveTo(xa,ya); ctx.lineTo(xb,yb); ctx.stroke();
   }
 
-  hitAreas.kagi=[]; hitAreas.trade=[];
+  hitAreas.kagi=[]; hitAreas.price=[]; hitAreas.trade=[];
+
+  // 入力価格の丸（先に描いて、転換点の丸を上に重ねる）
+  if(showPP){
+    for(let i=0;i<pricePoints.length;i++){
+      const p=pricePoints[i];
+      if(p.x<viewStart || p.x>viewEnd) continue;
+      const x=x2px(p.x), y=y2px(p.y);
+      ctx.fillStyle='#ffffff';
+      ctx.strokeStyle='#3498db';
+      ctx.lineWidth=2;
+      ctx.beginPath(); ctx.arc(x,y,4.5,0,Math.PI*2); ctx.fill(); ctx.stroke();
+      hitAreas.price.push({x,y,r:11,index:i});
+    }
+  }
+
+  // 転換点の丸
   for(let i=0;i<kagiData.length;i++){
     const p=kagiData[i];
     if(p.x<viewStart || p.x>viewEnd) continue;
@@ -482,7 +537,6 @@ function drawChart(){
     ctx.strokeStyle='#2c3e50'; ctx.lineWidth=2;
     ctx.beginPath(); ctx.arc(x,y,r,0,Math.PI*2); ctx.fill(); ctx.stroke();
 
-    // hit判定もCSS座標で持つ
     hitAreas.kagi.push({x,y,r:12,index:i});
   }
 
@@ -533,16 +587,26 @@ function drawChart(){
     hitAreas.trade.push({x,y,r:16,index:i});
   });
 
-  // 選択中の点：ツールチップ
+  // 選択中の転換点：ツールチップ
   if (selectedIdx !== null && kagiData[selectedIdx]) {
     const p = kagiData[selectedIdx];
     const x = x2px(p.x), y = y2px(p.y);
     ctx.strokeStyle = '#f1c40f';
     ctx.lineWidth = 3;
-    ctx.beginPath();
-    ctx.arc(x, y, 14, 0, Math.PI * 2);
-    ctx.stroke();
+    ctx.beginPath(); ctx.arc(x, y, 14, 0, Math.PI * 2); ctx.stroke();
+    drawTooltipAt(x, y, [
+      '¥' + p.y.toLocaleString(),
+      new Date(p.timestamp).toLocaleString()
+    ]);
+  }
 
+  // 選択中の入力価格：ツールチップ
+  if (showPP && selectedPriceIdx !== null && pricePoints[selectedPriceIdx]) {
+    const p = pricePoints[selectedPriceIdx];
+    const x = x2px(p.x), y = y2px(p.y);
+    ctx.strokeStyle = '#f1c40f';
+    ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.arc(x, y, 11, 0, Math.PI * 2); ctx.stroke();
     drawTooltipAt(x, y, [
       '¥' + p.y.toLocaleString(),
       new Date(p.timestamp).toLocaleString()
@@ -561,12 +625,11 @@ function canvasPoint(evt){
   const rect = el.kagiCanvas.getBoundingClientRect();
   const clientX = (evt.touches ? evt.touches[0].clientX : evt.clientX);
   const clientY = (evt.touches ? evt.touches[0].clientY : evt.clientY);
-  const x = clientX - rect.left;
-  const y = clientY - rect.top;
-  return {x, y};
+  return { x: clientX - rect.left, y: clientY - rect.top };
 }
 
 function pickNearest(x,y){
+  // 優先順：トレードマーク → 転換点 → 入力価格
   for(const a of hitAreas.trade){
     const dx=x-a.x,dy=y-a.y;
     if(dx*dx+dy*dy<=a.r*a.r) return {type:'trade',index:a.index};
@@ -575,7 +638,14 @@ function pickNearest(x,y){
     const dx=x-a.x,dy=y-a.y;
     if(dx*dx+dy*dy<=a.r*a.r) return {type:'kagi',index:a.index};
   }
-  return null;
+  // 入力価格は重なりが多いので最も近いものを選ぶ
+  let best=null, bestD=Infinity;
+  for(const a of hitAreas.price){
+    const dx=x-a.x,dy=y-a.y;
+    const d=dx*dx+dy*dy;
+    if(d<=a.r*a.r && d<bestD){ bestD=d; best={type:'price',index:a.index}; }
+  }
+  return best;
 }
 
 function onCanvasClick(e){
@@ -583,12 +653,14 @@ function onCanvasClick(e){
   const h=pickNearest(x,y);
   if(!h) return;
   if(h.type==='kagi'){
-    // 同じ点を再タップしたら表示解除（トグル）
     selectedIdx = (selectedIdx===h.index) ? null : h.index;
-    selectedTradeIdx=null;
+    selectedPriceIdx=null; selectedTradeIdx=null;
+  } else if(h.type==='price'){
+    selectedPriceIdx = (selectedPriceIdx===h.index) ? null : h.index;
+    selectedIdx=null; selectedTradeIdx=null;
   } else {
     selectedTradeIdx = (selectedTradeIdx===h.index) ? null : h.index;
-    selectedIdx=null;
+    selectedIdx=null; selectedPriceIdx=null;
   }
   drawChart();
   updateTradeList();
@@ -630,7 +702,8 @@ function updatePriceList(){
   }
   priceData.forEach((d,i)=>{
     const li=document.createElement('div'); li.className='item';
-    li.innerHTML=`<div><b>#${i+1}</b> ¥${d.price.toLocaleString()}<br><span class="info">${new Date(d.timestamp).toLocaleString()}</span></div>
+    const active=i===selectedPriceIdx?'style="text-decoration:underline;font-weight:700"':'';
+    li.innerHTML=`<div ${active}><b>#${i+1}</b> ¥${d.price.toLocaleString()}<br><span class="info">${new Date(d.timestamp).toLocaleString()}</span></div>
                   <button class="btn btn-red small" data-idx="${i}">削除</button>`;
     box.appendChild(li);
   });
@@ -644,7 +717,8 @@ function updateTradeList(){
   trades.forEach((t,i)=>{
     const li=document.createElement('div'); li.className='item';
     const active=i===selectedTradeIdx?'style="text-decoration:underline;font-weight:700"':'';
-    li.innerHTML=`<div ${active}><b>#${i+1}</b> ${t.type.toUpperCase()} ¥${t.y.toLocaleString()}<br><span class="info">${new Date(t.timestamp).toLocaleString()}</span></div>
+    const tag = t.src==='price' ? '入力' : '転換';
+    li.innerHTML=`<div ${active}><b>#${i+1}</b> ${t.type.toUpperCase()} ¥${t.y.toLocaleString()} <span class="badge">${tag}</span><br><span class="info">${new Date(t.timestamp).toLocaleString()}</span></div>
                   <button class="btn btn-red small" data-tidx="${i}">削除</button>`;
     box.appendChild(li);
   });
@@ -662,18 +736,25 @@ function addPrice(){
   const ts=el.datetimeInput.value?new Date(el.datetimeInput.value).getTime():Date.now();
   priceData.push({timestamp:ts,price:p});
   log(`価格追加: ¥${p.toLocaleString()}`);
-  selectedIdx=null;
+  selectedIdx=null; selectedPriceIdx=null;
   drawAll();
   el.priceInput.value='';
   onStateChanged();
 }
 function markSelected(){
-  if(selectedIdx===null) return alert('まずチャート上の点をタップ/クリック');
-  const type=el.tradeType.value; const p=kagiData[selectedIdx];
-  trades.push({x:p.x,y:p.y,type,timestamp:Date.now()});
+  let p=null, src=null;
+  if(selectedIdx!==null && kagiData[selectedIdx]){
+    p=kagiData[selectedIdx]; src='kagi';
+  } else if(selectedPriceIdx!==null && pricePoints[selectedPriceIdx]){
+    p=pricePoints[selectedPriceIdx]; src='price';
+  }
+  if(!p) return alert('まずチャート上の点をタップ/クリック');
+
+  const type=el.tradeType.value;
+  trades.push({x:p.x,y:p.y,type,src,timestamp:Date.now()});
   selectedTradeIdx=trades.length-1;
-  log(`${type==='buy'?'買い':'売り'}マーク: ¥${p.y.toLocaleString()}`);
-  selectedIdx=null;
+  log(`${type==='buy'?'買い':'売り'}マーク: ¥${p.y.toLocaleString()}（${src==='price'?'入力価格':'転換点'}）`);
+  selectedIdx=null; selectedPriceIdx=null;
   drawAll();
   onStateChanged();
 }
@@ -698,13 +779,14 @@ function clearAll(){
     alert('削除するデータがありません');
     return;
   }
-  const ok = confirm('全データを削除しますか？');
-  if(!ok) return;
+  if(!confirm('全データを削除しますか？')) return;
 
   priceData = [];
   trades = [];
   kagiData = [];
+  pricePoints = [];
   selectedIdx = null;
+  selectedPriceIdx = null;
   selectedTradeIdx = null;
   viewStart = 0;
   viewEnd = 0;
@@ -795,7 +877,7 @@ function importCSVText(text){
   const arr=parseCSV(text);
   if(!arr.length) return alert('CSVを解析できませんでした');
   priceData=arr; trades=[];
-  selectedIdx=null; selectedTradeIdx=null;
+  selectedIdx=null; selectedPriceIdx=null; selectedTradeIdx=null;
   log(`CSVインポート: ${arr.length}件`);
   drawAll(); onStateChanged();
 }
@@ -810,8 +892,7 @@ function updateViewRange(){
   if(!kagiData.length) return;
   const totalWidth = Math.max(...kagiData.map(p=>p.x)) + 1;
   const displayWidth = Math.min(maxViewWidth, totalWidth);
-  const slider = el.chartRange;
-  const val = parseInt(slider.value,10);
+  const val = parseInt(el.chartRange.value,10);
 
   if(val===100){
     viewEnd = totalWidth;
@@ -828,7 +909,10 @@ function zoomIn(){  maxViewWidth=Math.max(maxViewWidth-5,5); updateViewRange(); 
 function latest(){   el.chartRange.value=100; updateViewRange(); drawChart(); maybeAutoSave(); }
 
 function drawAll(){
-  kagiData = toPath( calcKagi(priceData, +el.reversalAmount.value) );
+  const res = calcKagi(priceData, +el.reversalAmount.value);
+  kagiData = toPath(res.points);
+  const segToX = buildSegToX(res.points);
+  pricePoints = buildPricePoints(priceData, res.segOfInput, segToX);
   updateViewRange();
   drawChart();
   updateTradeLog();
@@ -839,10 +923,9 @@ function drawAll(){
 /* ====== Gist 同期 ====== */
 function loadSyncPrefs(){
   try{
-    const token=localStorage.getItem(SYNC_KEYS.token)||'';
-    const id=localStorage.getItem(SYNC_KEYS.gist)||'';
-    const pub=localStorage.getItem(SYNC_KEYS.public)==='1';
-    el.gistToken.value=token; el.gistId.value=id; el.gistPublic.checked=pub;
+    el.gistToken.value=localStorage.getItem(SYNC_KEYS.token)||'';
+    el.gistId.value=localStorage.getItem(SYNC_KEYS.gist)||'';
+    el.gistPublic.checked=localStorage.getItem(SYNC_KEYS.public)==='1';
     el.autoSync.checked = localStorage.getItem(SYNC_KEYS.auto)==='1';
   }catch{}
 }
@@ -916,9 +999,10 @@ el.clearTradesBtn.onclick=clearTrades;
 
 el.recalculateBtn.onclick=()=>{ if(priceData.length){ drawAll(); onStateChanged(); } };
 el.reversalAmount.onchange=()=>{ if(priceData.length){ drawAll(); onStateChanged(); } };
+el.showPricePoints.addEventListener('change',()=>{ selectedPriceIdx=null; drawAll(); onStateChanged(); });
 
 el.sampleBtn.onclick=()=>{
-  priceData=[]; trades=[]; selectedIdx=null; selectedTradeIdx=null;
+  priceData=[]; trades=[]; selectedIdx=null; selectedPriceIdx=null; selectedTradeIdx=null;
   const p=[40000,40500,39500,40500,40000,41000,39000,42000,38000,43000,37000,44000,36000,45000,35000,46000,34000,47000,33000,48000,32000,47500,33500,46000,35000,44500,36500,43000,38000,41500];
   const base=Date.now()-p.length*60000;
   p.forEach((v,i)=>priceData.push({timestamp:base+i*60000,price:v}));
@@ -943,6 +1027,7 @@ el.priceList.addEventListener('click',e=>{
   const i=+btn.dataset.idx;
   const r=priceData.splice(i,1)[0];
   log(`入力削除: ¥${r.price.toLocaleString()}`);
+  selectedPriceIdx=null;
   drawAll(); onStateChanged();
 });
 el.tradeList.addEventListener('click',e=>{
@@ -1011,7 +1096,6 @@ function init(){
 
 window.addEventListener('load', ()=>{
   init();
-  // クリック＆タップ
   el.kagiCanvas.addEventListener('click', onCanvasClick);
   el.kagiCanvas.addEventListener('touchstart', onCanvasClick, {passive:true});
 });
