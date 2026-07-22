@@ -72,7 +72,7 @@ canvas{display:block;width:100%;height:380px;touch-action:manipulation;}
         <h2>カギ足パラメーター</h2>
         <label>転換幅 (円)</label>
         <input id="reversalAmount" type="number" class="input" value="50" step="1" min="1" />
-        <div class="section-note">※ 前回の高値/安値からこの金額以上の逆方向への動きで転換します</div>
+        <div class="section-note">※ 直近の高値／安値からこの金額以上の逆方向への動きで転換します</div>
         <div class="row" style="margin-top:8px">
           <button id="recalculateBtn" class="btn btn-amber small">🔄 再計算</button>
           <button id="shareLinkBtn" class="btn btn-dark small">🔗 共有リンク</button>
@@ -280,52 +280,67 @@ function tryImportFromURL(){
   }
 }
 
-/* ====== カギ足計算（改善版） ====== */
-function calcKagi(list, step) {
-  if (!list.length) return [];
+/* ====== カギ足計算（本来のカギ足仕様） ======
+   ・同方向の動きは線を延長するだけ（点は増えない）
+   ・直近の極値から転換幅以上の逆行が出たときだけ折り返す
+   ・転換幅未満の逆行は無視
+*/
+function calcKagi(list, step){
+  if(!list.length) return [];
+  if(step<=0) step=1;
 
-  const k = [];
-  let last = list[0].price;
-  let trend = 0; // 1: 上昇, -1: 下降
+  const k=[];
+  let extreme = list[0].price;   // 直近の極値（現在の線の先端）
+  let trend = 0;                 // 1:上昇 -1:下降 0:未確定
 
-  k.push({ x: 0, y: last, trend, timestamp: list[0].timestamp });
+  k.push({ y: extreme, trend: 0, timestamp: list[0].timestamp });
 
-  for (let i = 1; i < list.length; i++) {
-    let price = list[i].price;
-    let diff = price - last;
+  for(let i=1;i<list.length;i++){
+    const price = list[i].price;
+    const ts = list[i].timestamp;
 
-    // 上方向に何ステップ動いたか
-    while (diff >= step) {
-      last += step;
-      trend = 1;
-      k.push({
-        x: k.length,
-        y: last,
-        trend,
-        timestamp: list[i].timestamp
-      });
-      diff = price - last;
+    if(trend===0){
+      // 最初の方向が決まるまで：転換幅以上動いたら方向確定
+      if(price - extreme >= step){
+        trend = 1;
+        extreme = price;
+        k.push({ y: extreme, trend, timestamp: ts });
+      } else if(extreme - price >= step){
+        trend = -1;
+        extreme = price;
+        k.push({ y: extreme, trend, timestamp: ts });
+      }
+      continue;
     }
 
-    // 下方向に何ステップ動いたか
-    while (diff <= -step) {
-      last -= step;
-      trend = -1;
-      k.push({
-        x: k.length,
-        y: last,
-        trend,
-        timestamp: list[i].timestamp
-      });
-      diff = price - last;
+    if(trend===1){
+      if(price > extreme){
+        // 同方向：先端を伸ばす（点は増やさない）
+        extreme = price;
+        k[k.length-1] = { y: extreme, trend, timestamp: ts };
+      } else if(extreme - price >= step){
+        // 転換：下降へ
+        trend = -1;
+        extreme = price;
+        k.push({ y: extreme, trend, timestamp: ts });
+      }
+    } else {
+      if(price < extreme){
+        extreme = price;
+        k[k.length-1] = { y: extreme, trend, timestamp: ts };
+      } else if(price - extreme >= step){
+        trend = 1;
+        extreme = price;
+        k.push({ y: extreme, trend, timestamp: ts });
+      }
     }
   }
 
-  return k;
+  return k.map((p,i)=>({ ...p, x:i }));
 }
 
 function toPath(d){
-  if(d.length<2) return d;
+  if(d.length<2) return d.map((p,i)=>({...p,x:i}));
   const r=[];let x=0;r.push({...d[0],x});
   for(let i=1;i<d.length;i++){
     if(d[i].trend!==d[i-1].trend){
@@ -357,7 +372,6 @@ function resizeCanvas(){
 window.addEventListener('resize', ()=>{ resizeCanvas(); drawChart(); });
 
 function clearCanvasCssSpace(){
-  // いまのtransform(dpr)のままだと clearRect はCSS座標でOK
   const W = el.kagiCanvas.clientWidth, H = el.kagiCanvas.clientHeight;
   ctx.clearRect(0,0,W,H);
 }
@@ -447,7 +461,7 @@ function drawChart(){
   const x2px = x => pad.l + ((x - viewStart)/(viewEnd - viewStart)) * (W - pad.l - pad.r);
   const y2px = y => H - pad.b - ((y - minY)/(maxY - minY)) * (H - pad.t - pad.b);
 
-  ctx.lineWidth = 3.5; ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+  ctx.lineWidth = 2; ctx.lineJoin = 'round'; ctx.lineCap = 'round';
   for(let i=1;i<kagiData.length;i++){
     const a=kagiData[i-1], b=kagiData[i];
     if(a.x<viewStart && b.x<viewStart) continue;
@@ -468,7 +482,7 @@ function drawChart(){
     ctx.strokeStyle='#2c3e50'; ctx.lineWidth=2;
     ctx.beginPath(); ctx.arc(x,y,r,0,Math.PI*2); ctx.fill(); ctx.stroke();
 
-    // hit判定もCSS座標で持つ（←重要）
+    // hit判定もCSS座標で持つ
     hitAreas.kagi.push({x,y,r:12,index:i});
   }
 
@@ -542,13 +556,13 @@ function drawChart(){
   el.rangeInfo.textContent = (totalWidth<=maxViewWidth) ? '全データ表示' : `${viewStart+1}-${viewEnd}/${totalWidth}`;
 }
 
-/* ====== ヒット判定（修正版：dprを掛けない） ====== */
+/* ====== ヒット判定 ====== */
 function canvasPoint(evt){
   const rect = el.kagiCanvas.getBoundingClientRect();
   const clientX = (evt.touches ? evt.touches[0].clientX : evt.clientX);
   const clientY = (evt.touches ? evt.touches[0].clientY : evt.clientY);
-  const x = clientX - rect.left; // ← CSS座標
-  const y = clientY - rect.top;  // ← CSS座標
+  const x = clientX - rect.left;
+  const y = clientY - rect.top;
   return {x, y};
 }
 
@@ -569,13 +583,15 @@ function onCanvasClick(e){
   const h=pickNearest(x,y);
   if(!h) return;
   if(h.type==='kagi'){
-    selectedIdx=h.index;
+    // 同じ点を再タップしたら表示解除（トグル）
+    selectedIdx = (selectedIdx===h.index) ? null : h.index;
     selectedTradeIdx=null;
   } else {
-    selectedTradeIdx=h.index;
+    selectedTradeIdx = (selectedTradeIdx===h.index) ? null : h.index;
     selectedIdx=null;
   }
   drawChart();
+  updateTradeList();
 }
 
 /* ====== UI ====== */
